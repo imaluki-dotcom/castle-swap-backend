@@ -2,44 +2,44 @@ import express from 'express';
 import admin from 'firebase-admin';
 import fetch from 'node-fetch';
 
-const app = express();
-app.use(express.json());
+const router = express.Router();
 
-const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET; // get from App Store Connect
-const GOOGLE_SERVICE_ACCOUNT = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON);
+const APPLE_SHARED_SECRET = process.env.APPLE_SHARED_SECRET;
+const GOOGLE_SERVICE_ACCOUNT = JSON.parse(process.env.GOOGLE_SERVICE_ACCOUNT_JSON || '{}');
 
-admin.initializeApp({ credential: admin.credential.cert(GOOGLE_SERVICE_ACCOUNT) });
+// Init Firebase Admin
+if (!admin.apps.length) {
+  admin.initializeApp({
+    credential: admin.credential.cert(GOOGLE_SERVICE_ACCOUNT)
+  });
+}
 const db = admin.firestore();
 
-// POST /verify-purchase - frontend sends receipt here after IAP success
-app.post('/verify-purchase', async (req, res) => {
+router.post('/verify-purchase', async (req, res) => {
   const { receipt, platform, productId, userId } = req.body;
 
-  if (!receipt ||!platform ||!userId) {
+  if (!receipt ||!platform ||!userId ||!productId) {
     return res.status(400).json({ error: 'Missing fields' });
   }
 
   try {
     let isValid = false;
     let expiresAt = null;
-    let tier = productId;
 
     if (platform === 'ios') {
-      // 1. Verify with Apple
-      const appleRes = await fetch('https://buy.itunes.apple.com/verifyReceipt', {
+      let appleRes = await fetch('https://buy.itunes.apple.com/verifyReceipt', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ 'receipt-data': receipt, password: APPLE_SHARED_SECRET, 'exclude-old-transactions': true })
       });
-      const data = await appleRes.json();
+      let data = await appleRes.json();
 
-      // Sandbox fallback if production fails
       if (data.status === 21007) {
-        const sandboxRes = await fetch('https://sandbox.itunes.apple.com/verifyReceipt', {
+        appleRes = await fetch('https://sandbox.itunes.apple.com/verifyReceipt', {
           method: 'POST',
           body: JSON.stringify({ 'receipt-data': receipt, password: APPLE_SHARED_SECRET })
         });
-        Object.assign(data, await sandboxRes.json());
+        data = await appleRes.json();
       }
 
       if (data.status === 0) {
@@ -49,46 +49,25 @@ app.post('/verify-purchase', async (req, res) => {
       }
     }
 
-    if (platform === 'android') {
-      // 2. Verify with Google Play Developer API
-      const auth = new admin.google.auth.GoogleAuth({
-        credentials: GOOGLE_SERVICE_ACCOUNT,
-        scopes: ['https://www.googleapis.com/auth/androidpublisher']
-      });
-      const client = await auth.getClient();
-
-      const [response] = await client.request({
-        url: `https://androidpublisher.googleapis.com/androidpublisher/v3/applications/com.castleswap.app/purchases/products/${productId}/tokens/${receipt}`
-      });
-
-      if (response.data.purchaseState === 0) {
-        isValid = true;
-        expiresAt = new Date(parseInt(response.data.expiryTimeMillis));
-      }
-    }
-
     if (!isValid) return res.status(400).json({ error: 'Invalid receipt' });
 
-    // 3. Save to Firebase - backend is source of truth
     const userRef = db.collection('users').doc(userId);
 
     if (productId === 'power_pack') {
-      // Consumable: add 5 boosts
       await userRef.set({
         powerBoosts: admin.firestore.FieldValue.increment(5),
         lastBoostPurchase: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
     } else {
-      // Subscription: set tier + expiry
       await userRef.set({
-        tier,
+        tier: productId,
         platform,
         expiresAt: admin.firestore.Timestamp.fromDate(expiresAt),
         lastVerified: admin.firestore.FieldValue.serverTimestamp()
       }, { merge: true });
     }
 
-    res.json({ success: true, tier, expiresAt });
+    res.json({ success: true, tier: productId, expiresAt });
 
   } catch (err) {
     console.error('Verification error:', err);
@@ -96,15 +75,4 @@ app.post('/verify-purchase', async (req, res) => {
   }
 });
 
-// Middleware to check if user is Pro on every swap
-app.use('/swap', async (req, res, next) => {
-  const { userId } = req.body;
-  const userDoc = await db.collection('users').doc(userId).get();
-  const user = userDoc.data() || {};
-
-  const now = new Date();
-  const isPro = user.tier && user.expiresAt?.toDate() > now;
-
-  req.userTier = isPro? user.tier : 'free';
-  next();
-});
+export default router;
