@@ -57,3 +57,5 @@ app.post('/webhook', (req, res) => {
 app.listen(PORT, () => {
   console.log(`Castle Swap API running on port ${PORT}`);
 });
+import iapRoutes from './routes/iap.js';
+app.use('/', iapRoutes);
